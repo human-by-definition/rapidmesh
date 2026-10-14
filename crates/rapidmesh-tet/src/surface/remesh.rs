@@ -49,6 +49,10 @@ const CREASE_RADIUS: f64 = 0.5;
 /// A change may move the surface by this share of the size at most.
 const DEVIATION: f64 = 0.1;
 
+/// A fixed point is at a facet corner, or on a facet edge, within this
+/// share of the shortest edge there.
+const SAME_POINT: f64 = 1e-6;
+
 /// Remeshes the face whose `facets` (wound to its front) carry the loops
 /// `rings` and the edges inside it `inner` (global ids of `points`; their
 /// PLC chains `chains`), with the `corners` it touches and the `required`
@@ -553,13 +557,24 @@ impl Mesh {
     }
 
     /// Puts each fixed point into the mesh: onto the point at its place, or
-    /// into the locked edge it lies on.
+    /// into the locked edge it lies on. A facet corner within a rounding of
+    /// a fixed point is that point and moves onto it: a corner on an
+    /// axis-aligned plane takes the plane's coordinate exactly, its facets
+    /// only to a rounding, and a split there would leave an edge of an ulp.
     fn embed(&mut self, fixed: &[(u32, V3)]) -> Result<(), &'static str> {
         let id: FxHashMap<[u64; 3], u32> = self
             .p
             .iter()
             .enumerate()
             .map(|(i, x)| (x.map(f64::to_bits), i as u32))
+            .collect();
+        let shortest: Vec<f64> = (0..self.p.len() as u32)
+            .map(|v| {
+                self.neighbours(v)
+                    .iter()
+                    .map(|&w| dist(self.pt(v), self.pt(w)))
+                    .fold(f64::INFINITY, f64::min)
+            })
             .collect();
         let edges: Vec<(u32, u32)> = self.locked.iter().copied().collect();
         let mean = edges
@@ -573,10 +588,24 @@ impl Mesh {
             let (lo, hi) = bbox([self.pt(a), self.pt(b)]);
             grid.insert_box(lo, hi, i);
         }
+        let mut corners: HashGrid<u32> = HashGrid::new(cell);
+        for v in 0..self.p.len() as u32 {
+            if !self.star[v as usize].is_empty() {
+                corners.insert(self.pt(v), v);
+            }
+        }
         // The points on each locked edge, by their place along it.
         let mut along: FxHashMap<usize, Vec<(f64, u32, V3)>> = FxHashMap::default();
         for &(g, q) in fixed {
-            if let Some(&v) = id.get(&q.map(f64::to_bits)) {
+            let at = id.get(&q.map(f64::to_bits)).copied().or_else(|| {
+                corners
+                    .around(corners.key(q), 1)
+                    .copied()
+                    .filter(|&v| dist(self.pt(v), q) <= SAME_POINT * shortest[v as usize])
+                    .min_by(|&a, &b| dist(self.pt(a), q).total_cmp(&dist(self.pt(b), q)))
+            });
+            if let Some(v) = at {
+                self.p[v as usize] = q;
                 self.slot[v as usize] = Some(Slot::Global(g));
                 continue;
             }
@@ -593,7 +622,7 @@ impl Mesh {
             };
             let (a, b) = edges[i];
             let (pa, pb) = (self.pt(a), self.pt(b));
-            if d > 1e-6 * dist(pa, pb).max(1e-300) {
+            if d > SAME_POINT * dist(pa, pb).max(1e-300) {
                 return Err("an edge sample off the facets");
             }
             let t = dot(sub(q, pa), sub(pb, pa)) / dot(sub(pb, pa), sub(pb, pa)).max(1e-300);
@@ -1226,4 +1255,51 @@ impl Mesh {
 /// The unit vector along `a`, +z for a zero one.
 fn unit_or_z(a: V3) -> V3 {
     rapidmesh_exact::vector::unit(a).unwrap_or([0.0, 0.0, 1.0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The corners of a face on an axis-aligned plane take the plane's
+    /// coordinate exactly, its facets only to a rounding: a corner the face
+    /// only touches is still the facet corner there, and a ring sample a
+    /// rounding off a facet corner takes it instead of an edge of an ulp.
+    #[test]
+    fn samples_a_rounding_off_the_facet_corners_take_them() {
+        let z = 15.0;
+        let off = 14.999999999999998;
+        let c = [0.5, 0.5, z];
+        let sq = [[0.0, 0.0, z], [1.0, 0.0, z], [1.0, 1.0, z], [0.0, 1.0, z]];
+        let facets: Vec<[V3; 3]> = (0..4).map(|k| [sq[k], sq[(k + 1) % 4], c]).collect();
+        let mut points: Vec<V3> = sq.to_vec();
+        points[1][2] = off;
+        points.push([0.5, 0.5, off]);
+        let out = remesh(
+            &facets,
+            &[vec![0, 1, 2, 3]],
+            &[],
+            &[],
+            &[4],
+            &[],
+            &points,
+            &|_| 0.5,
+            0.1,
+            None,
+        )
+        .unwrap();
+        let has = |g: u32| out.slots.contains(&Slot::Global(g));
+        assert!((0..5).all(has));
+        let at = |s: &Slot| match *s {
+            Slot::Global(g) => points[g as usize],
+            Slot::Own(i) => out.own[i as usize],
+        };
+        let shortest = out
+            .tris
+            .iter()
+            .flat_map(|t| (0..3).map(move |k| (t[k], t[(k + 1) % 3])))
+            .map(|(a, b)| dist(at(&out.slots[a]), at(&out.slots[b])))
+            .fold(f64::INFINITY, f64::min);
+        assert!(shortest > 0.1, "an edge of {shortest:e}");
+    }
 }

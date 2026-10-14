@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "rapidmesh-brep",
  "rapidmesh-exact",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-brep"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-csg"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "geometry-predicates",
  "num-rational",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-exact"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "geometry-predicates",
  "num-bigint",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-geom"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "i_overlay",
  "num-rational",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-step"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-testutil"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-tet"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "geometry-predicates",
  "rapidmesh-brep",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-topo"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "rapidmesh-exact",
  "rapidmesh-geom",

@@ -399,6 +399,9 @@ struct Rounds<'m> {
     required: Vec<Vec<V3>>,
     /// The edges flips made.
     flipped_in: FxHashSet<(u32, u32)>,
+    /// The facets of each face (a composite's of all its faces) the edits
+    /// of its kept mesh hold to, made when first needed.
+    facets: FxHashMap<usize, Facets>,
     /// Rounds that took samples a face asked for.
     refines: usize,
     /// The Delaunay tetrahedralization of each region at its last check.
@@ -592,6 +595,7 @@ impl<'m> Rounds<'m> {
             meshes,
             required: vec![Vec::new(); brep.faces.len()],
             flipped_in: FxHashSet::default(),
+            facets: FxHashMap::default(),
             refines: 0,
             dts: FxHashMap::default(),
             region_missing: FxHashMap::default(),
@@ -1128,6 +1132,16 @@ impl<'m> Rounds<'m> {
             if dirty.contains(&f) && !in_place.contains(&f) {
                 continue;
             }
+            if self.meshes[f].is_none() {
+                continue;
+            }
+            let model = self.model;
+            let members = || self.comps.members(f);
+            let facets = self
+                .facets
+                .entry(f)
+                .or_insert_with(|| Facets::of(model, &members()));
+            let keeps = |old: V3, n: V3, c: V3| facets.keeps(old, n, c);
             let Some(stars) = self.meshes[f].as_mut() else {
                 continue;
             };
@@ -1137,7 +1151,7 @@ impl<'m> Rounds<'m> {
             // regions can have its Delaunay edge in one and not the other):
             // it splits.
             if flip && !self.flipped_in.contains(&key(ga, gb)) {
-                if let Some((c, d)) = flip_kept(tris, stars, ga, gb, points) {
+                if let Some((c, d)) = flip_kept(tris, stars, ga, gb, points, &keeps) {
                     self.flipped_in.insert(key(c, d));
                     edited.push(f);
                     continue;
@@ -1145,7 +1159,14 @@ impl<'m> Rounds<'m> {
             }
             let (pa, pb) = (points[ga as usize], points[gb as usize]);
             let mid: V3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
-            let q = brep.surface(brep.faces[f].surface).closest(mid).0;
+            // A face meshed on its facets (a composite of several, a scan)
+            // takes the point on them; its carrier is one face's only.
+            let surface = brep.surface(brep.faces[f].surface);
+            let q = if facets.composite || matches!(surface, rapidmesh_geom::Surface::Discrete(_)) {
+                facets.nearest(mid).map_or(mid, |x| x.0)
+            } else {
+                surface.closest(mid).0
+            };
             let least = 2.0 * REQUIRED_SPACING * self.domain.h_at_surf(q);
             if dist2(pa, pb) <= least * least {
                 continue;
@@ -1155,7 +1176,7 @@ impl<'m> Rounds<'m> {
             let v = points.len() as u32;
             if let Some(q) = [q, mid]
                 .into_iter()
-                .find(|&x| split_kept(tris, stars, ga, gb, v, x, points, 2))
+                .find(|&x| split_kept(tris, stars, ga, gb, v, x, points, 2, &keeps))
             {
                 self.b.points.push(q);
                 self.edge_of.push(NO_EDGE);
@@ -1191,13 +1212,33 @@ impl<'m> Rounds<'m> {
                 if !in_place.contains(&f) || failed.contains(&f) {
                     continue;
                 }
-                let Some(stars) = self.meshes[f].as_mut() else {
+                if self.meshes[f].is_none() {
                     failed.insert(f);
+                    continue;
+                }
+                let model = self.model;
+                let members = self.comps.members(f);
+                let facets = self
+                    .facets
+                    .entry(f)
+                    .or_insert_with(|| Facets::of(model, &members));
+                let keeps = |old: V3, n: V3, c: V3| facets.keeps(old, n, c);
+                let Some(stars) = self.meshes[f].as_mut() else {
                     continue;
                 };
                 let (tris, points) = (&mut self.b.faces[f], &self.b.points);
-                if split_kept(tris, stars, ga, gb, g, points[g as usize], points, 1) {
-                    legalize(tris, stars, g, points, &fixed);
+                if split_kept(
+                    tris,
+                    stars,
+                    ga,
+                    gb,
+                    g,
+                    points[g as usize],
+                    points,
+                    1,
+                    &keeps,
+                ) {
+                    legalize(tris, stars, g, points, &fixed, &keeps);
                 } else {
                     failed.insert(f);
                 }
@@ -1513,6 +1554,7 @@ fn flip_kept(
     a: u32,
     b: u32,
     points: &[V3],
+    keeps: &Keeps,
 ) -> Option<(u32, u32)> {
     let [t0, t1] = stars.on_edge(tris, a, b)[..] else {
         return None;
@@ -1532,7 +1574,13 @@ fn flip_kept(
     let p = |i: u32| points[i as usize];
     let normal = |t: [u32; 3]| cross(sub(p(t[1]), p(t[0])), sub(p(t[2]), p(t[0])));
     let old = add(normal(tris[t0]), normal(tris[t1]));
-    if !(dot(normal(n0), old) > 0.0 && dot(normal(n1), old) > 0.0) {
+    let centre = |t: [u32; 3]| -> V3 {
+        std::array::from_fn(|k| (p(t[0])[k] + p(t[1])[k] + p(t[2])[k]) / 3.0)
+    };
+    if !(dot(normal(n0), old) > 0.0 && dot(normal(n1), old) > 0.0)
+        || !keeps(old, normal(n0), centre(n0))
+        || !keeps(old, normal(n1), centre(n1))
+    {
         return None;
     }
     tris[t0] = n0;
@@ -1542,6 +1590,71 @@ fn flip_kept(
     stars.link(c, t1);
     stars.link(d, t0);
     Some((c, d))
+}
+
+/// Whether an edit of a kept face mesh keeps a new triangle (normal and
+/// centre) facing the way the triangles it replaces (their normal) face.
+type Keeps<'a> = dyn Fn(V3, V3, V3) -> bool + 'a;
+
+/// The facets of a face, of all faces of a composite, wound to its front:
+/// what the edits of its kept mesh hold to. A flip or split is local and
+/// sees only the triangles it changes; where the face bends sharply (the
+/// faces of a composite meet at an angle) a new triangle can face against
+/// the surface and fold the face, which no tetrahedralization takes.
+pub(crate) struct Facets {
+    bvh: rapidmesh_brep::index::FacetBvh,
+    normals: Vec<V3>,
+    /// Whether they are those of several faces (a composite).
+    pub composite: bool,
+}
+
+impl Facets {
+    pub(crate) fn of(model: &Model, members: &[usize]) -> Facets {
+        let tris: Vec<[V3; 3]> = members
+            .iter()
+            .flat_map(|&f| front_facets(model, f))
+            .collect();
+        Facets::on(&tris, members.len() > 1)
+    }
+
+    fn on(tris: &[[V3; 3]], composite: bool) -> Facets {
+        let normals = tris
+            .iter()
+            .map(|t| {
+                let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+                let l = dot(n, n).sqrt();
+                if l > 0.0 {
+                    n.map(|x| x / l)
+                } else {
+                    [0.0; 3]
+                }
+            })
+            .collect();
+        let tris: Vec<rapidmesh_csg::Tri> = tris
+            .iter()
+            .map(|t| rapidmesh_csg::Tri::new(t[0], t[1], t[2]))
+            .collect();
+        Facets {
+            bvh: rapidmesh_brep::index::FacetBvh::build(&tris),
+            normals,
+            composite,
+        }
+    }
+
+    /// The point on the facets nearest `p` and the unit normal there.
+    pub(crate) fn nearest(&self, p: V3) -> Option<(V3, V3)> {
+        let (i, _) = self.bvh.nearest(p)?;
+        let t = self.bvh.tris()[i as usize].v;
+        let q = rapidmesh_exact::vector::closest_on_tri(p, t[0], t[1], t[2]);
+        Some((q, self.normals[i as usize]))
+    }
+
+    /// Whether a triangle of normal `n` at `c`, made in place of triangles
+    /// of normal `old`, faces the facets there the way they did.
+    fn keeps(&self, old: V3, n: V3, c: V3) -> bool {
+        self.nearest(c)
+            .is_none_or(|(_, m)| dot(n, m) * dot(old, m) > 0.0)
+    }
 }
 
 /// Lawson flips round the new point `v` of a kept face mesh: each edge
@@ -1555,6 +1668,7 @@ fn legalize(
     v: u32,
     points: &[V3],
     fixed: &dyn Fn(u32) -> bool,
+    keeps: &Keeps,
 ) {
     let p = |i: u32| points[i as usize];
     let mut stack: Vec<(u32, u32)> = stars.0.get(&v).map_or(Vec::new(), |ts| {
@@ -1590,7 +1704,7 @@ fn legalize(
         if !across_too_wide(p(a), p(b), p(v), p(far)) {
             continue;
         }
-        if flip_kept(tris, stars, a, b, points).is_some() {
+        if flip_kept(tris, stars, a, b, points, keeps).is_some() {
             stack.push((a, far));
             stack.push((far, b));
         }
@@ -1611,6 +1725,7 @@ fn split_kept(
     q: V3,
     points: &[V3],
     sides: usize,
+    keeps: &Keeps,
 ) -> bool {
     let ts = stars.on_edge(tris, a, b);
     if ts.len() != sides {
@@ -1628,7 +1743,13 @@ fn split_kept(
             return false;
         };
         let old = normal(p(x), p(y), p(c));
-        if !(dot(normal(p(x), q, p(c)), old) > 0.0 && dot(normal(q, p(y), p(c)), old) > 0.0) {
+        let centre =
+            |u: V3, w: V3| -> V3 { std::array::from_fn(|k| (u[k] + w[k] + p(c)[k]) / 3.0) };
+        let (first, second) = (normal(p(x), q, p(c)), normal(q, p(y), p(c)));
+        if !(dot(first, old) > 0.0 && dot(second, old) > 0.0)
+            || !keeps(old, first, centre(p(x), q))
+            || !keeps(old, second, centre(q, p(y)))
+        {
             return false;
         }
         halves.push((t, [x, v, c], [v, y, c]));
@@ -2483,5 +2604,39 @@ mod tests {
             }
         }
         assert!(shared >= 2, "{shared}");
+    }
+
+    /// A composite folded sharply (a wall leaning back 30 degrees over a
+    /// floor): flipping an edge of the kept mesh on the wall towards a
+    /// point on the floor turns the new triangles the way the old pair
+    /// faced on average, but one of them against the wall it lies on. The
+    /// flip is refused; without the facets it went through.
+    #[test]
+    fn a_flip_that_turns_a_triangle_against_the_facets_is_refused() {
+        let (s, c) = (0.5, 0.75f64.sqrt());
+        let wall = |t: f64, y: f64| [t * c, y, t * s];
+        let floor = |x: f64, y: f64| [x, y, 0.0];
+        let facets = Facets::on(
+            &[
+                [floor(-3.0, -3.0), floor(0.0, -3.0), floor(0.0, 3.0)],
+                [floor(-3.0, -3.0), floor(0.0, 3.0), floor(-3.0, 3.0)],
+                [wall(0.0, -3.0), wall(3.0, 3.0), wall(0.0, 3.0)],
+                [wall(0.0, -3.0), wall(3.0, -3.0), wall(3.0, 3.0)],
+            ],
+            true,
+        );
+        let points = [
+            wall(1.6, -1.3),
+            wall(0.3, -1.1),
+            floor(-0.9, -1.5),
+            wall(0.5, -1.0),
+        ];
+        let flip = |keeps: &Keeps| {
+            let mut tris = vec![[0, 1, 2], [1, 0, 3]];
+            let mut stars = Stars::of(&tris);
+            flip_kept(&mut tris, &mut stars, 0, 1, &points, keeps)
+        };
+        assert_eq!(flip(&|_, _, _| true), Some((2, 3)));
+        assert_eq!(flip(&|old, n, c| facets.keeps(old, n, c)), None);
     }
 }

@@ -37,6 +37,16 @@ pub const FLAT_DEG: f64 = 15.0;
 /// the tet's shortest edge to a corner of its cavity.
 const FLAT_GAP: f64 = 0.2;
 
+/// A point off a tet flat to a rounding goes in only where the tets it
+/// makes are no flatter than this (degrees): where they would be (inside a
+/// thin layer) the flat tet stays as the layer has it.
+const PLANAR_LEAST: f64 = FLAT_DEG / 3.0;
+
+/// Four corners whose tet holds less than this share of the cube of its
+/// longest edge lie on one plane but for their rounding (the weld
+/// tolerance of the assembly, 1e-12 of the model).
+const COPLANAR: f64 = 1e-10;
+
 /// The refined tets of a region: `tets` over the region's points (global
 /// ids) and the new points, numbered from `base` in the order of `points`.
 pub struct Refined {
@@ -77,6 +87,16 @@ pub fn refine(
             k
         })
         .collect();
+    // Each constraint as given (the region on its positive side), by its
+    // sorted corners; none for a sheet inside the region, given from both
+    // sides.
+    let mut wound: FxHashMap<[u32; 3], Option<[u32; 3]>> = FxHashMap::default();
+    for f in faces {
+        let f = f.map(|v| local[&v]);
+        let mut k = f;
+        k.sort_unstable();
+        wound.entry(k).and_modify(|w| *w = None).or_insert(Some(f));
+    }
     let t = Tets::wired(tets.iter().map(|t| t.map(|v| local[&v])).collect());
     // Per tet, which of its faces are constraints (bit `i` for face `i`).
     let cmask: Vec<u8> = (0..t.tets.len() as u32)
@@ -199,11 +219,23 @@ pub fn refine(
             }
             let q = f.map(|j| p[j]);
             let n = cross(sub(q[1], q[0]), sub(q[2], q[0]));
-            // Turned towards the tet's vertex across the face.
-            let s = if dot(n, sub(p[i], q[0])) > 0.0 {
-                1.0
-            } else {
-                -1.0
+            // Turned into the region: against the right-hand normal of the
+            // face as given. A sheet, open to the region on both sides,
+            // turns towards the tet's vertex across it. (That vertex is
+            // no guide on a wall: two faces of a flat tet on one plane
+            // have it in their plane, and their normals would cancel as
+            // across a thin layer.)
+            let s = match wound.get(&k) {
+                Some(Some(w)) => {
+                    let o = w.map(|v| m.p(v));
+                    if dot(n, cross(sub(o[1], o[0]), sub(o[2], o[0]))) > 0.0 {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+                }
+                _ if dot(n, sub(p[i], q[0])) > 0.0 => 1.0,
+                _ => -1.0,
             };
             let l = dot(n, n).sqrt().max(1e-300);
             for k in 0..3 {
@@ -224,6 +256,40 @@ pub fn refine(
                 if m.insert(home, c, FLAT_GAP * h, least, &mut made) {
                     done = true;
                     break;
+                }
+            }
+        }
+        // A tet whose corners lie on one plane to a rounding is no layer,
+        // however its faces sit (four corners of a planar boundary face,
+        // or of faces that meet, which the wrapping took for a tet). Its
+        // centroid is on every face of it, which no cavity sees from
+        // inside: a point just off the plane goes in, into the region
+        // where the boundary is on that plane, else on either side.
+        let longest = (0..4)
+            .flat_map(|i| (i + 1..4).map(move |j| (i, j)))
+            .map(|(i, j)| dist(p[i], p[j]))
+            .fold(0.0, f64::max);
+        let volume = dot(sub(p[1], p[0]), cross(sub(p[2], p[0]), sub(p[3], p[0]))).abs();
+        let planar = volume <= COPLANAR * longest.powi(3);
+        if planar && !done {
+            let normal = TET_FACES
+                .iter()
+                .map(|f| cross(sub(p[f[1]], p[f[0]]), sub(p[f[2]], p[f[0]])))
+                .max_by(|a, b| dot(*a, *a).total_cmp(&dot(*b, *b)))
+                .map(|n| n.map(|x| x / dot(n, n).sqrt().max(1e-300)))
+                .unwrap_or([0.0; 3]);
+            let sides: Vec<V3> = match off {
+                Some(n) => vec![n],
+                None => vec![normal, normal.map(|x| -x)],
+            };
+            'near: for share in [0.25, 0.1, 0.5] {
+                for d in &sides {
+                    let c: V3 = std::array::from_fn(|k| g[k] + share * shortest * d[k]);
+                    let Some(home) = m.walk(t, c) else { continue };
+                    if m.insert(home, c, FLAT_GAP * shortest, PLANAR_LEAST, &mut made) {
+                        done = true;
+                        break 'near;
+                    }
                 }
             }
         }
@@ -498,5 +564,65 @@ impl Mesh {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pyramid whose base is meshed along one diagonal while its two tets
+    /// stand on the other, with the flat tet of the four base corners
+    /// between them (the wrapping makes it where a planar face is a
+    /// rounding off its plane, #383). Its two faces on the base see each
+    /// other's corner in their plane; the region is above both all the
+    /// same, and a point goes in there.
+    #[test]
+    fn a_flat_tet_on_a_planar_face_takes_a_point() {
+        let points: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1e-17],
+            [0.5, 0.5, 1.0],
+        ];
+        let p = |v: u32| points[v as usize];
+        let inner = [0.5, 0.5, 0.3];
+        let wind = |f: [u32; 3]| {
+            if orient(p(f[0]), p(f[1]), p(f[2]), inner) > 0 {
+                f
+            } else {
+                [f[1], f[0], f[2]]
+            }
+        };
+        let faces: Vec<[u32; 3]> = [
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 1, 4],
+            [1, 2, 4],
+            [2, 3, 4],
+            [3, 0, 4],
+        ]
+        .map(wind)
+        .to_vec();
+        let positive = |t: [u32; 4]| {
+            if orient(p(t[0]), p(t[1]), p(t[2]), p(t[3])) > 0 {
+                t
+            } else {
+                [t[1], t[0], t[2], t[3]]
+            }
+        };
+        let tets: Vec<[u32; 4]> = [[0, 1, 2, 3], [0, 1, 3, 4], [1, 2, 3, 4]]
+            .map(positive)
+            .to_vec();
+        assert!(tet_min_dihedral(tets[0].map(p)) < 1e-6);
+        let out = refine(&points, &tets, &faces, &[0; 6], &|_| 10.0, 5, 16);
+        let all: Vec<V3> = points.iter().chain(&out.points).copied().collect();
+        let least = out
+            .tets
+            .iter()
+            .map(|t| tet_min_dihedral(t.map(|v| all[v as usize])))
+            .fold(f64::INFINITY, f64::min);
+        assert!(least > 1.0, "{least}");
     }
 }
